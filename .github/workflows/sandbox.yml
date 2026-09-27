@@ -1,0 +1,79 @@
+name: Shipp Ephemeral Sandbox Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: 'Unique Task ID'
+        required: true
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+      command:
+        description: 'Command or script to execute'
+        required: true
+      callback_url:
+        description: 'Shipp webhook callback URL'
+        required: true
+      auth_token:
+        description: 'Authentication token for callback'
+        required: true
+
+jobs:
+  execute:
+    name: Run Ephemeral Task
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Tools & Workspace
+        run: |
+          mkdir -p /tmp/sandbox
+          echo "Starting ephemeral sandbox run for task ${{ github.event.inputs.task_id }}"
+
+      - name: Run Sandbox Script
+        id: runner
+        env:
+          SANDBOX_CMD: ${{ github.event.inputs.command }}
+        run: |
+          set +e
+          START_TS=$(date +%s)
+          
+          OUTPUT=$(eval "$SANDBOX_CMD" 2>&1)
+          EXIT_CODE=$?
+          
+          END_TS=$(date +%s)
+          DURATION=$((END_TS - START_TS))
+          
+          echo "TASK_EXIT_CODE=$EXIT_CODE" >> $GITHUB_ENV
+          echo "TASK_DURATION=$DURATION" >> $GITHUB_ENV
+          
+          echo "$OUTPUT" | tail -c 40000 > /tmp/task_output.txt
+
+      - name: Send Callback to Shipp
+        if: always()
+        env:
+          TASK_ID: ${{ github.event.inputs.task_id }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          AUTH_TOKEN: ${{ github.event.inputs.auth_token }}
+        run: |
+          touch /tmp/task_output.txt
+          EXIT_CODE="${TASK_EXIT_CODE:-1}"
+          DURATION="${TASK_DURATION:-0}"
+          
+          jq -n \
+            --arg task_id "$TASK_ID" \
+            --arg chat_id "$CHAT_ID" \
+            --argjson exit_code "$EXIT_CODE" \
+            --argjson duration "$DURATION" \
+            --rawfile output /tmp/task_output.txt \
+            '{task_id: $task_id, chat_id: ($chat_id | tonumber), exit_code: $exit_code, duration_seconds: $duration, output: $output}' \
+            > /tmp/payload.json
+          
+          curl -s -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Sandbox-Token: $AUTH_TOKEN" \
+            --data-binary @/tmp/payload.json
