@@ -9,9 +9,22 @@ on:
       chat_id:
         description: 'Telegram Chat ID'
         required: true
+      repo:
+        description: 'Repository scope for the durable chat workspace'
+        required: false
+        default: ''
       command:
         description: 'Command or script to execute'
-        required: true
+        required: false
+        default: ''
+      script_b64:
+        description: 'Base64 encoded Python script'
+        required: false
+        default: ''
+      script_filename:
+        description: 'Filename for the script'
+        required: false
+        default: 'script.py'
       callback_url:
         description: 'Shipp webhook callback URL'
         required: true
@@ -31,18 +44,39 @@ jobs:
       - name: Setup Tools & Workspace
         run: |
           mkdir -p /tmp/sandbox
+          python3 -m pip install --quiet --no-warn-script-location pandas numpy openpyxl matplotlib seaborn scipy tabulate || true
           echo "Starting ephemeral sandbox run for task ${{ github.event.inputs.task_id }}"
 
       - name: Run Sandbox Script
         id: runner
         env:
           SANDBOX_CMD: ${{ github.event.inputs.command }}
+          SCRIPT_B64: ${{ github.event.inputs.script_b64 }}
+          SCRIPT_FILENAME: ${{ github.event.inputs.script_filename }}
         run: |
           set +e
           START_TS=$(date +%s)
           
-          OUTPUT=$(eval "$SANDBOX_CMD" 2>&1)
-          EXIT_CODE=$?
+          if [ -n "$SCRIPT_B64" ]; then
+            if [ -n "$SANDBOX_CMD" ]; then
+              eval "$SANDBOX_CMD" > /dev/null 2>&1
+            fi
+            FNAME="${SCRIPT_FILENAME:-script.py}"
+            echo "$SCRIPT_B64" | base64 -d > "$FNAME"
+            echo "--- py_compile syntax check ---"
+            COMPILE_OUT=$(python3 -m py_compile "$FNAME" 2>&1)
+            COMPILE_EXIT=$?
+            if [ $COMPILE_EXIT -ne 0 ]; then
+              OUTPUT="[py_compile Syntax Error]:\n$COMPILE_OUT"
+              EXIT_CODE=$COMPILE_EXIT
+            else
+              OUTPUT=$(python3 "$FNAME" 2>&1)
+              EXIT_CODE=$?
+            fi
+          else
+            OUTPUT=$(eval "$SANDBOX_CMD" 2>&1)
+            EXIT_CODE=$?
+          fi
           
           END_TS=$(date +%s)
           DURATION=$((END_TS - START_TS))
@@ -52,25 +86,99 @@ jobs:
           
           echo "$OUTPUT" | tail -c 40000 > /tmp/task_output.txt
 
+          if [ -f "aggregates.json" ]; then
+            echo -e "\n--- aggregates.json ---\n" >> /tmp/task_output.txt
+            cat "aggregates.json" >> /tmp/task_output.txt
+          fi
+          if [ -f "audit.json" ]; then
+            echo -e "\n--- audit.json ---\n" >> /tmp/task_output.txt
+            cat "audit.json" >> /tmp/task_output.txt
+          fi
+          if [ -f "cleaning_log.json" ]; then
+            echo -e "\n--- cleaning_log.json ---\n" >> /tmp/task_output.txt
+            cat "cleaning_log.json" >> /tmp/task_output.txt
+          fi
+
+          # Checkpoint changed and untracked workspace files so the next task can
+          # restore the working state without copying the whole runner checkout.
+          python3 - <<'PY'
+          import os, subprocess, tarfile
+
+          ignored_dirs = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.cache', '.pytest_cache'}
+          ignored_names = {'.env', '.env.local', '.env.production', 'id_rsa', 'id_ed25519', 'credentials.json'}
+          archive_path = '/tmp/shipp_workspace.tar.gz'
+          deleted = []
+          try:
+              status = subprocess.check_output(['git', 'status', '--porcelain', '-z', '--untracked-files=all'])
+              changed = []
+              for entry in status.split(b'\0'):
+                  if len(entry) <= 3:
+                      continue
+                  state = entry[:2].decode('ascii', 'ignore')
+                  name = entry[3:].decode('utf-8', 'surrogateescape')
+                  if 'D' in state:
+                      deleted.append(name)
+                  else:
+                      changed.append(name)
+          except (OSError, subprocess.CalledProcessError):
+              changed = []
+          try:
+              with open('.shipp_workspace_manifest', encoding='utf-8') as manifest:
+                  for line in manifest:
+                      name = os.path.normpath(line.strip())
+                      if name and name != '.' and not name.startswith('..') and not os.path.isabs(name) and not os.path.exists(name):
+                          deleted.append(name)
+          except OSError:
+              pass
+          changed.extend(name for name in ('aggregates.json', 'audit.json', 'cleaning_log.json') if os.path.isfile(name))
+          changed = list(dict.fromkeys(changed))
+          with tarfile.open(archive_path, 'w:gz') as archive:
+              for name in changed[:100]:
+                  normalized = os.path.normpath(name)
+                  parts = normalized.split(os.sep)
+                  if normalized.startswith('..') or os.path.isabs(normalized) or any(part in ignored_dirs for part in parts):
+                      continue
+                  base = os.path.basename(normalized)
+                  if normalized == '.shipp_workspace_manifest' or base.lower().startswith('.env') or base.lower() in ignored_names or base.lower().endswith(('.pem', '.key', '.p12', '.pfx', '.keystore')):
+                      continue
+                  try:
+                      if os.path.isfile(normalized) and os.path.getsize(normalized) <= 2 * 1024 * 1024:
+                          archive.add(normalized, arcname=normalized, recursive=False)
+                  except (OSError, tarfile.TarError):
+                      pass
+          if os.path.getsize(archive_path) > 2 * 1024 * 1024:
+              os.remove(archive_path)
+          import json
+          with open('/tmp/shipp_workspace_deleted.json', 'w', encoding='utf-8') as target:
+              json.dump(deleted[:100], target)
+          PY
+
       - name: Send Callback to Shipp
         if: always()
         env:
           TASK_ID: ${{ github.event.inputs.task_id }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
+          REPO: ${{ github.event.inputs.repo }}
           CALLBACK_URL: ${{ github.event.inputs.callback_url }}
           AUTH_TOKEN: ${{ github.event.inputs.auth_token }}
         run: |
           touch /tmp/task_output.txt
+          touch /tmp/shipp_workspace.tar.gz
+          test -s /tmp/shipp_workspace_deleted.json || echo '[]' > /tmp/shipp_workspace_deleted.json
+          base64 -w 0 /tmp/shipp_workspace.tar.gz > /tmp/shipp_workspace.b64
           EXIT_CODE="${TASK_EXIT_CODE:-1}"
           DURATION="${TASK_DURATION:-0}"
           
           jq -n \
             --arg task_id "$TASK_ID" \
             --arg chat_id "$CHAT_ID" \
+            --arg repo "$REPO" \
             --argjson exit_code "$EXIT_CODE" \
             --argjson duration "$DURATION" \
             --rawfile output /tmp/task_output.txt \
-            '{task_id: $task_id, chat_id: ($chat_id | tonumber), exit_code: $exit_code, duration_seconds: $duration, output: $output}' \
+            --rawfile workspace_archive_b64 /tmp/shipp_workspace.b64 \
+            --slurpfile workspace_deleted /tmp/shipp_workspace_deleted.json \
+            '{task_id: $task_id, chat_id: ($chat_id | tonumber), repo: $repo, exit_code: $exit_code, duration_seconds: $duration, output: $output, workspace_archive_b64: $workspace_archive_b64, workspace_deleted: ($workspace_deleted[0] // [])}' \
             > /tmp/payload.json
           
           curl -s -X POST "$CALLBACK_URL" \
