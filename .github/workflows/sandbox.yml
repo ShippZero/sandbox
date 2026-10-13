@@ -13,6 +13,10 @@ on:
         description: 'Repository scope for the durable chat workspace'
         required: false
         default: ''
+      payload_url:
+        description: 'Authenticated Shipp task payload URL'
+        required: false
+        default: ''
       command:
         description: 'Command or script to execute'
         required: false
@@ -53,57 +57,66 @@ jobs:
           SANDBOX_CMD: ${{ github.event.inputs.command }}
           SCRIPT_B64: ${{ github.event.inputs.script_b64 }}
           SCRIPT_FILENAME: ${{ github.event.inputs.script_filename }}
+          PAYLOAD_URL: ${{ github.event.inputs.payload_url }}
+          AUTH_TOKEN: ${{ github.event.inputs.auth_token }}
         run: |
           set +e
           START_TS=$(date +%s)
-          
-          if [ -n "$SCRIPT_B64" ]; then
-            if [ -n "$SANDBOX_CMD" ]; then
-              eval "$SANDBOX_CMD" > /dev/null 2>&1
-            fi
-            FNAME="${SCRIPT_FILENAME:-script.py}"
-            echo "$SCRIPT_B64" | base64 -d > "$FNAME"
-            echo "--- py_compile syntax check ---"
-            COMPILE_OUT=$(python3 -m py_compile "$FNAME" 2>&1)
-            COMPILE_EXIT=$?
-            if [ $COMPILE_EXIT -ne 0 ]; then
-              OUTPUT="[py_compile Syntax Error]:\n$COMPILE_OUT"
-              EXIT_CODE=$COMPILE_EXIT
+          if [ -n "$PAYLOAD_URL" ]; then
+            curl --fail --silent --show-error --retry 3 --retry-delay 1 \
+              -H "X-Sandbox-Token: $AUTH_TOKEN" "$PAYLOAD_URL" -o /tmp/shipp_task_payload.json
+            FETCH_EXIT=$?
+            if [ $FETCH_EXIT -ne 0 ]; then
+              echo "Could not fetch task payload from Shipp (curl exit $FETCH_EXIT)" > /tmp/task_output.txt
+              EXIT_CODE=$FETCH_EXIT
+              SANDBOX_CMD=""
+              SCRIPT_B64=""
             else
-              OUTPUT=$(python3 "$FNAME" 2>&1)
+              jq -r '.command // ""' /tmp/shipp_task_payload.json > /tmp/shipp_command.sh
+              SCRIPT_B64=$(jq -r '.script_b64 // ""' /tmp/shipp_task_payload.json)
+              SCRIPT_FILENAME=$(jq -r '.script_filename // "script.py"' /tmp/shipp_task_payload.json)
+              SANDBOX_CMD="payload-command"
+            fi
+          fi
+          if [ "${EXIT_CODE:-0}" -eq 0 ]; then
+            if [ -n "$PAYLOAD_URL" ]; then
+              CMD_FILE=/tmp/shipp_command.sh
+            else
+              printf '%s' "$SANDBOX_CMD" > /tmp/shipp_command.sh
+              CMD_FILE=/tmp/shipp_command.sh
+            fi
+            if [ -n "$SCRIPT_B64" ]; then
+              if [ -s "$CMD_FILE" ]; then bash "$CMD_FILE" > /dev/null 2>&1; fi
+              FNAME=$(basename "${SCRIPT_FILENAME:-script.py}")
+              printf '%s' "$SCRIPT_B64" | base64 -d > "$FNAME"
+              COMPILE_OUT=$(python3 -m py_compile "$FNAME" 2>&1)
+              COMPILE_EXIT=$?
+              if [ $COMPILE_EXIT -ne 0 ]; then
+                OUTPUT="[py_compile Syntax Error]:\n$COMPILE_OUT"
+                EXIT_CODE=$COMPILE_EXIT
+              else
+                OUTPUT=$(python3 "$FNAME" 2>&1)
+                EXIT_CODE=$?
+              fi
+            else
+              OUTPUT=$(bash "$CMD_FILE" 2>&1)
               EXIT_CODE=$?
             fi
-          else
-            OUTPUT=$(eval "$SANDBOX_CMD" 2>&1)
-            EXIT_CODE=$?
+            echo "$OUTPUT" > /tmp/task_output.txt
           fi
-          
           END_TS=$(date +%s)
           DURATION=$((END_TS - START_TS))
-          
           echo "TASK_EXIT_CODE=$EXIT_CODE" >> $GITHUB_ENV
           echo "TASK_DURATION=$DURATION" >> $GITHUB_ENV
-          
-          echo "$OUTPUT" | tail -c 40000 > /tmp/task_output.txt
-
-          if [ -f "aggregates.json" ]; then
-            echo -e "\n--- aggregates.json ---\n" >> /tmp/task_output.txt
-            cat "aggregates.json" >> /tmp/task_output.txt
-          fi
-          if [ -f "audit.json" ]; then
-            echo -e "\n--- audit.json ---\n" >> /tmp/task_output.txt
-            cat "audit.json" >> /tmp/task_output.txt
-          fi
-          if [ -f "cleaning_log.json" ]; then
-            echo -e "\n--- cleaning_log.json ---\n" >> /tmp/task_output.txt
-            cat "cleaning_log.json" >> /tmp/task_output.txt
-          fi
-
-          # Checkpoint changed and untracked workspace files so the next task can
-          # restore the working state without copying the whole runner checkout.
+          tail -c 40000 /tmp/task_output.txt > /tmp/task_output.trimmed && mv /tmp/task_output.trimmed /tmp/task_output.txt
+          for artifact in aggregates.json audit.json cleaning_log.json; do
+            if [ -f "$artifact" ]; then
+              printf "\n--- %s ---\n" "$artifact" >> /tmp/task_output.txt
+              cat "$artifact" >> /tmp/task_output.txt
+            fi
+          done
           python3 - <<'PY'
           import os, subprocess, tarfile
-
           ignored_dirs = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.cache', '.pytest_cache'}
           ignored_names = {'.env', '.env.local', '.env.production', 'id_rsa', 'id_ed25519', 'credentials.json'}
           archive_path = '/tmp/shipp_workspace.tar.gz'
@@ -112,45 +125,29 @@ jobs:
               status = subprocess.check_output(['git', 'status', '--porcelain', '-z', '--untracked-files=all'])
               changed = []
               for entry in status.split(b'\0'):
-                  if len(entry) <= 3:
-                      continue
-                  state = entry[:2].decode('ascii', 'ignore')
-                  name = entry[3:].decode('utf-8', 'surrogateescape')
-                  if 'D' in state:
-                      deleted.append(name)
-                  else:
-                      changed.append(name)
-          except (OSError, subprocess.CalledProcessError):
-              changed = []
+                  if len(entry) <= 3: continue
+                  state, name = entry[:2].decode('ascii', 'ignore'), entry[3:].decode('utf-8', 'surrogateescape')
+                  (deleted if 'D' in state else changed).append(name)
+          except (OSError, subprocess.CalledProcessError): changed = []
           try:
               with open('.shipp_workspace_manifest', encoding='utf-8') as manifest:
                   for line in manifest:
                       name = os.path.normpath(line.strip())
-                      if name and name != '.' and not name.startswith('..') and not os.path.isabs(name) and not os.path.exists(name):
-                          deleted.append(name)
-          except OSError:
-              pass
+                      if name and name != '.' and not name.startswith('..') and not os.path.isabs(name) and not os.path.exists(name): deleted.append(name)
+          except OSError: pass
           changed.extend(name for name in ('aggregates.json', 'audit.json', 'cleaning_log.json') if os.path.isfile(name))
-          changed = list(dict.fromkeys(changed))
           with tarfile.open(archive_path, 'w:gz') as archive:
-              for name in changed[:100]:
+              for name in list(dict.fromkeys(changed))[:100]:
                   normalized = os.path.normpath(name)
                   parts = normalized.split(os.sep)
-                  if normalized.startswith('..') or os.path.isabs(normalized) or any(part in ignored_dirs for part in parts):
-                      continue
                   base = os.path.basename(normalized)
-                  if normalized == '.shipp_workspace_manifest' or base.lower().startswith('.env') or base.lower() in ignored_names or base.lower().endswith(('.pem', '.key', '.p12', '.pfx', '.keystore')):
-                      continue
+                  if normalized.startswith('..') or os.path.isabs(normalized) or any(part in ignored_dirs for part in parts) or normalized == '.shipp_workspace_manifest' or base.lower().startswith('.env') or base.lower() in ignored_names or base.lower().endswith(('.pem', '.key', '.p12', '.pfx', '.keystore')): continue
                   try:
-                      if os.path.isfile(normalized) and os.path.getsize(normalized) <= 2 * 1024 * 1024:
-                          archive.add(normalized, arcname=normalized, recursive=False)
-                  except (OSError, tarfile.TarError):
-                      pass
-          if os.path.getsize(archive_path) > 2 * 1024 * 1024:
-              os.remove(archive_path)
+                      if os.path.isfile(normalized) and os.path.getsize(normalized) <= 2 * 1024 * 1024: archive.add(normalized, arcname=normalized, recursive=False)
+                  except (OSError, tarfile.TarError): pass
+          if os.path.getsize(archive_path) > 2 * 1024 * 1024: os.remove(archive_path)
           import json
-          with open('/tmp/shipp_workspace_deleted.json', 'w', encoding='utf-8') as target:
-              json.dump(deleted[:100], target)
+          with open('/tmp/shipp_workspace_deleted.json', 'w', encoding='utf-8') as target: json.dump(deleted[:100], target)
           PY
 
       - name: Send Callback to Shipp
